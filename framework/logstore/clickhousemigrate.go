@@ -400,6 +400,46 @@ func migrationClickHouseWebhookDeliveriesTable(ctx context.Context, db *gorm.DB,
 	return clickhouseReconcileTTL(ctx, db, "webhook_deliveries", cluster, chLogsTTL(retentionDays), logger)
 }
 
+// migrationClickHouseWarpConversationTables creates Warp's saved-chat tables.
+//
+// No TTL clause, and that is deliberate rather than an omission. Every other
+// table here expires on logs_store.retention_days, which is the wrong number
+// for this content: Warp history has its own warp.history_retention_days, and
+// that setting is not reachable from a log-store migration. Borrowing the logs
+// figure would silently delete somebody's saved chats on a schedule nobody
+// chose, so age-based expiry runs from the application instead, through
+// DeleteWarpConversationsOlderThan.
+//
+// warp_conversations orders by id alone because id is its dedup identity: a
+// rename or a new message re-inserts the whole row (ClickHouse has no cheap
+// UPDATE) and ReplacingMergeTree must collapse those onto the original. Putting
+// owner_id or updated_at ahead of it would make each version a distinct key and
+// leave every edit behind as a duplicate row. The list query pays a scan for
+// that, which is affordable: PruneWarpConversations caps the table per owner.
+//
+// warp_messages can afford the leading conversation_id because it never
+// changes, so (conversation_id, id) is still unique per message - and it is the
+// predicate every read uses.
+func migrationClickHouseWarpConversationTables(ctx context.Context, db *gorm.DB, cluster string, _ int, logger schemas.Logger) error {
+	logger.Info("[logstore] clickhouse: creating tables warp_conversations, warp_messages")
+	if err := clickhouseCreateTable(ctx, db, &WarpConversation{}, chTableOpts{
+		table:   "warp_conversations",
+		orderBy: "id",
+	}, cluster); err != nil {
+		return fmt.Errorf("clickhouse: create warp_conversations table: %w", err)
+	}
+	if err := clickhouseReconcileColumns(ctx, db, &WarpConversation{}, "warp_conversations", cluster, logger); err != nil {
+		return err
+	}
+	if err := clickhouseCreateTable(ctx, db, &WarpMessage{}, chTableOpts{
+		table:   "warp_messages",
+		orderBy: "(conversation_id, id)",
+	}, cluster); err != nil {
+		return fmt.Errorf("clickhouse: create warp_messages table: %w", err)
+	}
+	return clickhouseReconcileColumns(ctx, db, &WarpMessage{}, "warp_messages", cluster, logger)
+}
+
 // clickhouseMigrationSteps lists the per-table migrations in execution order,
 // mirroring logstoreMigrationSteps for the SQL stores.
 var clickhouseMigrationSteps = []clickhouseMigrationStep{
@@ -407,6 +447,7 @@ var clickhouseMigrationSteps = []clickhouseMigrationStep{
 	migrationClickHouseMCPToolLogsTable,
 	migrationClickHouseAsyncJobsTable,
 	migrationClickHouseWebhookDeliveriesTable,
+	migrationClickHouseWarpConversationTables,
 }
 
 // triggerClickHouseMigrations runs all registered ClickHouse table migrations

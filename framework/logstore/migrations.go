@@ -323,6 +323,8 @@ var logstoreMigrationSteps = []migrationStep{
 	{IDs: []string{"logs_add_served_model_column"}, run: migrationAddServedModelColumn},
 	{IDs: []string{"logs_add_tool_call_names_column"}, run: migrationAddToolCallNamesColumn},
 	{IDs: []string{"mcp_tool_logs_add_governance_snapshots"}, run: migrationAddMCPGovernanceSnapshots},
+	{IDs: []string{"logs_add_warp_conversation_tables"}, run: migrationAddWarpConversationTables},
+	{IDs: []string{"logs_add_warp_conversations_updated_at_index"}, run: migrationAddWarpConversationsUpdatedAtIndex},
 }
 
 // areThereAnyPendingMigrations returns true if there are any pending migrations to be applied.
@@ -4877,6 +4879,107 @@ func migrationAddMCPGovernanceSnapshots(ctx context.Context, db *gorm.DB, logger
 	}})
 	if err := m.Migrate(); err != nil {
 		return fmt.Errorf("error while adding governance snapshot columns to mcp tool logs: %s", err.Error())
+	}
+	return nil
+}
+
+// migrationAddWarpConversationTables creates Warp's saved-chat storage.
+//
+// These live in the log store rather than the config store: a transcript is
+// user-generated content that grows with use and carries the same prompt text
+// the logs do, not configuration an install is worthless without. See
+// warpconversations.go.
+func migrationAddWarpConversationTables(ctx context.Context, db *gorm.DB, logger schemas.Logger) error {
+	migrationName := "logs_add_warp_conversation_tables"
+	logger.Info("[logstore] starting migration %s", migrationName)
+	defer logger.Info("[logstore] finished migration %s", migrationName)
+	// Transactional so a boot that dies between the two tables leaves neither,
+	// rather than a conversations table whose messages have nowhere to go.
+	//
+	// No boundDDLLockWait, unlike the migrations that alter logs: this one only
+	// creates tables that do not exist yet, so it takes no lock any running query
+	// could be holding and has nothing to time out against.
+	opts := *migrator.DefaultOptions
+	opts.UseTransaction = true
+	m := migrator.New(db, &opts, []*migrator.Migration{{
+		ID: migrationName,
+		Migrate: func(tx *gorm.DB) error {
+			return tx.WithContext(ctx).AutoMigrate(&WarpConversation{}, &WarpMessage{})
+		},
+		Rollback: func(tx *gorm.DB) error {
+			return rollbackWarpConversationTables(tx.WithContext(ctx))
+		},
+	}})
+	if err := m.Migrate(); err != nil {
+		return fmt.Errorf("error running %s migration: %s", migrationName, err.Error())
+	}
+	return nil
+}
+
+// rollbackWarpConversationTables drops Warp's history tables, but only while
+// they are empty.
+//
+// These hold user content, not schema: a saved conversation is something
+// someone can reopen, so dropping a populated pair is deleting their data
+// rather than reversing a migration. Empty is still reversible, which keeps a
+// failed upgrade recoverable without putting saved chats at risk.
+func rollbackWarpConversationTables(tx *gorm.DB) error {
+	for _, table := range []any{&WarpMessage{}, &WarpConversation{}} {
+		if !tx.Migrator().HasTable(table) {
+			continue
+		}
+		var rows int64
+		if err := tx.Model(table).Count(&rows).Error; err != nil {
+			return fmt.Errorf("could not check warp history before rollback: %w", err)
+		}
+		if rows > 0 {
+			return fmt.Errorf("logs_add_warp_conversation_tables is non-rollbackable: warp_conversations and warp_messages hold saved chats, and dropping them would delete that content rather than reverse a schema change; clear the history first if the rollback is genuinely intended")
+		}
+	}
+	return tx.Migrator().DropTable(&WarpMessage{}, &WarpConversation{})
+}
+
+// migrationAddWarpConversationsUpdatedAtIndex adds the index the retention
+// sweep needs.
+//
+// A migration of its own rather than a wider AutoMigrate in the step that
+// created the tables: applied ids are recorded and never re-run, so an install
+// that already has warp_conversations would never gain this index, and the
+// hourly sweep would keep scanning the whole table there forever.
+func migrationAddWarpConversationsUpdatedAtIndex(ctx context.Context, db *gorm.DB, logger schemas.Logger) error {
+	migrationName := "logs_add_warp_conversations_updated_at_index"
+	logger.Info("[logstore] starting migration %s", migrationName)
+	defer logger.Info("[logstore] finished migration %s", migrationName)
+	opts := *migrator.DefaultOptions
+	opts.UseTransaction = true
+	m := migrator.New(db, &opts, []*migrator.Migration{{
+		ID: migrationName,
+		Migrate: func(tx *gorm.DB) error {
+			tx = tx.WithContext(ctx)
+			mg := tx.Migrator()
+			if mg.HasIndex(&WarpConversation{}, "idx_warp_conversations_updated_at") {
+				return nil
+			}
+			// Bounded: this locks an existing table, unlike the create-table step.
+			if err := boundDDLLockWait(tx); err != nil {
+				return err
+			}
+			if err := mg.CreateIndex(&WarpConversation{}, "idx_warp_conversations_updated_at"); err != nil {
+				return fmt.Errorf("create warp_conversations updated_at index: %w", err)
+			}
+			return nil
+		},
+		Rollback: func(tx *gorm.DB) error {
+			// Purely an access path: dropping it costs performance, never content.
+			mg := tx.WithContext(ctx).Migrator()
+			if !mg.HasIndex(&WarpConversation{}, "idx_warp_conversations_updated_at") {
+				return nil
+			}
+			return mg.DropIndex(&WarpConversation{}, "idx_warp_conversations_updated_at")
+		},
+	}})
+	if err := m.Migrate(); err != nil {
+		return fmt.Errorf("error running %s migration: %s", migrationName, err.Error())
 	}
 	return nil
 }

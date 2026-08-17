@@ -33,6 +33,7 @@ export interface WarpConfigPayloadFields {
 	api_key_id: string;
 	max_iterations: number;
 	request_timeout_seconds: number;
+	history_retention_days: number;
 	system_prompt_suffix: string;
 }
 
@@ -53,6 +54,7 @@ export function buildWarpConfigPayload(form: WarpConfigPayloadFields): WarpConfi
 		api_key_id: form.api_key_id.trim(),
 		max_iterations: form.max_iterations,
 		request_timeout_seconds: form.request_timeout_seconds,
+		history_retention_days: form.history_retention_days,
 		system_prompt_suffix: form.system_prompt_suffix,
 	};
 }
