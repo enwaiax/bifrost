@@ -2243,6 +2243,14 @@ func (s *BifrostHTTPServer) ReloadPlugin(ctx context.Context, name string, path 
 	if routingResponsesPlugin, ok := plugin.(routing.ResponsesExecutorSetter); ok {
 		routingResponsesPlugin.SetResponsesRequestExecutor(s.Client.ResponsesRequest)
 	}
+	// Rebind Warp's reader onto the live service rather than rebuilding the
+	// handler: routes were registered at startup and hold the original
+	// handler's closures, so a fresh handler would never be reached. Without
+	// this, enabling logging at runtime leaves the chat endpoint answering 503
+	// until the process restarts.
+	if loggerPlugin, ok := plugin.(*logging.LoggerPlugin); ok && s.WarpHandler != nil {
+		s.WarpHandler.Service().SetLogReader(handlers.NewWarpLogReader(loggerPlugin.GetPluginLogManager()))
+	}
 	return s.SyncLoadedPlugin(ctx, name, plugin, placement, order)
 }
 
@@ -2414,9 +2422,21 @@ func (s *BifrostHTTPServer) RegisterAPIRoutes(ctx context.Context, callbacks Ser
 		s.Config.NotificationPublisher = s.NotificationService.Publish
 		s.NotificationService.Start(s.Ctx)
 	}
-	if s.WarpHandler == nil {
-		s.WarpHandler = handlers.NewWarpHandler(s.Config.ConfigStore, logger)
+	// Rebuilt unconditionally rather than behind a nil check: Bootstrap constructs
+	// Warp before plugins load, so the instance it made has no log manager and
+	// would never register the chat route. This is the first point where the
+	// logging plugin is known, so this is where the real service is made.
+	//
+	// A nil log manager here is a supported deployment (logging disabled), not a
+	// failure - Warp then serves only its config routes.
+	var warpLogManager logging.LogManager
+	if loggerPlugin != nil {
+		warpLogManager = loggerPlugin.GetPluginLogManager()
 	}
+	if s.WarpHandler != nil {
+		s.WarpHandler.Shutdown()
+	}
+	s.WarpHandler = handlers.NewWarpHandler(s.Config.ConfigStore, warpLogManager, logger)
 	// Start WebSocket heartbeat
 	s.WebSocketHandler.StartHeartbeat()
 	// Adding telemetry middleware
@@ -2717,7 +2737,9 @@ func (s *BifrostHTTPServer) Bootstrap(ctx context.Context) error {
 	s.NotificationService = handlers.NewNotificationService(s.Config.ConfigStore, s.WebSocketHandler)
 	s.Config.NotificationPublisher = s.NotificationService.Publish
 	s.NotificationService.Start(s.Ctx)
-	s.WarpHandler = handlers.NewWarpHandler(s.Config.ConfigStore, logger)
+	// Bootstrap runs before plugins load, so Warp gets its config routes here and
+	// its chat route later in RegisterAPIRoutes once the log manager is known.
+	s.WarpHandler = handlers.NewWarpHandler(s.Config.ConfigStore, nil, logger)
 	// Initializing plugin loader. Allowlist entries are validated now - a malformed entry
 	// fails server startup rather than silently no-oping, since this is security-relaxing
 	// config for SSRF protection on custom plugin downloads.
@@ -3137,6 +3159,11 @@ func (s *BifrostHTTPServer) Start() error {
 			logger.Info("shutting down bifrost client...")
 			s.Client.Shutdown()
 			logger.Info("bifrost client shutdown completed")
+			// Warp holds a second, dedicated Bifrost instance with its own worker
+			// pool, so it needs its own shutdown.
+			if s.WarpHandler != nil {
+				s.WarpHandler.Shutdown()
+			}
 			logger.Info("cleaning up storage engines...")
 			// Cleanup server-specific components
 			if s.LogsCleaner != nil {
