@@ -14,10 +14,12 @@ WarpConfig:
     configured:
       type: boolean
       description: |
-        Whether Warp has everything it needs to answer a question — enabled,
-        with a provider and a model. A credential is deliberately not part of
-        this test, since a provider reached over a trusted network through
-        `base_url` legitimately needs none.
+        Whether Warp has everything it needs to answer a question: enabled, with
+        a provider and a model, and an embedding space - embedding provider,
+        embedding model, a positive embedding dimension and a namespace - since
+        semantic search over the logs is part of answering. A credential is
+        deliberately not part of this test, since a provider reached over a
+        trusted network through `base_url` legitimately needs none.
     enabled:
       type: boolean
       description: Whether the operator has switched Warp on.
@@ -72,6 +74,40 @@ WarpConfig:
         Appended to Warp's built-in system prompt. Additive only: an operator
         can teach Warp local naming conventions, but cannot remove the tool-use
         and scoping instructions the built-in prompt establishes.
+    embedding_provider:
+      type: string
+      description: Provider used to embed gateway conversations for semantic search.
+      example: openai
+    embedding_model:
+      type: string
+      description: Embedding model used for both indexing and queries.
+      example: text-embedding-3-small
+    embedding_api_key_id:
+      type: string
+      description: Optional reference to one of the embedding provider's configured keys.
+    embedding_dimension:
+      type: integer
+      # No positive minimum. A deployment that has never configured Warp gets a
+      # 200 with configured:false and zeroes, deliberately, so the settings page
+      # can render its empty form - and a minimum of 1 made that documented
+      # empty state fail its own schema on every fresh install. The positive
+      # requirement lives on the write side, where WarpConfigInput enforces it
+      # for an enabled config.
+      minimum: 0
+      example: 1536
+    log_vector_store_namespace:
+      type: string
+      default: BifrostWarpLogs
+    semantic_search_threshold:
+      type: number
+      exclusiveMinimum: 0
+      maximum: 1
+      default: 0.8
+    semantic_search_limit:
+      type: integer
+      minimum: 1
+      maximum: 25
+      default: 10
   required:
     - configured
     - enabled
@@ -80,6 +116,12 @@ WarpConfig:
     - max_iterations
     - request_timeout_seconds
     - history_retention_days
+    - embedding_provider
+    - embedding_model
+    - embedding_dimension
+    - log_vector_store_namespace
+    - semantic_search_threshold
+    - semantic_search_limit
 
 WarpConfigInput:
   type: object
@@ -87,6 +129,29 @@ WarpConfigInput:
     The write body. Only a config that claims to be usable has to be complete:
     when `enabled` is false, `provider` and `model` may be empty, so an operator
     can fill the form in over more than one sitting.
+
+    Switching `enabled` on is what makes the rest required - see the conditional
+    below, which mirrors what the server enforces so a generated client learns
+    the rule from the schema rather than from a rejected request.
+  # Nothing is required unconditionally: a disabled draft is a valid write.
+  if:
+    properties:
+      enabled:
+        const: true
+    required:
+      - enabled
+  then:
+    required:
+      - provider
+      - model
+      - embedding_provider
+      - embedding_model
+      - embedding_dimension
+    properties:
+      embedding_dimension:
+        # Any positive size is accepted; the value has to match the embedding
+        # model's own output dimension, which is why no maximum is imposed.
+        minimum: 1
   properties:
     enabled:
       type: boolean
@@ -126,6 +191,36 @@ WarpConfigInput:
         policy question with no technically correct ceiling.
     system_prompt_suffix:
       type: string
+    embedding_provider:
+      type: string
+      description: Required when `enabled` is true.
+    embedding_model:
+      type: string
+      description: Required when `enabled` is true.
+    embedding_api_key_id:
+      type: string
+    embedding_dimension:
+      type: integer
+      minimum: 0
+      description: Must be positive when `enabled` is true.
+    log_vector_store_namespace:
+      type: string
+      default: BifrostWarpLogs
+    semantic_search_threshold:
+      type: number
+      minimum: 0
+      maximum: 1
+      default: 0.8
+      description: |
+        Zero means "use the default". ValidateConfigInput resolves an explicit
+        zero before validating, so the write is accepted; the resolved value on
+        WarpConfig keeps the positive bound.
+    semantic_search_limit:
+      type: integer
+      minimum: 0
+      maximum: 25
+      default: 10
+      description: Zero means "use the default", resolved before validation.
 
 WarpUnavailable:
   type: object
