@@ -32,6 +32,7 @@ type ConfigView struct {
 	LogVectorStoreNamespace string                `json:"log_vector_store_namespace"`
 	SemanticSearchThreshold float64               `json:"semantic_search_threshold"`
 	SemanticSearchLimit     int                   `json:"semantic_search_limit"`
+	VectorStoreConnected    bool                  `json:"vector_store_connected"`
 }
 
 // ConfigInput is a configuration write.
@@ -179,9 +180,10 @@ func (s *Service) ConfigView(ctx context.Context) (ConfigView, error) {
 			LogVectorStoreNamespace: schemas.WarpDefaultLogVectorStoreNamespace,
 			SemanticSearchThreshold: schemas.WarpDefaultSemanticSearchThreshold,
 			SemanticSearchLimit:     schemas.WarpDefaultSemanticSearchLimit,
+			VectorStoreConnected:    s.vectorStore != nil,
 		}, nil
 	}
-	return configViewFromRow(row), nil
+	return s.configViewFromRow(row), nil
 }
 
 // SaveConfig validates and stores a configuration, returning the view a caller
@@ -202,12 +204,29 @@ func (s *Service) SaveConfig(ctx context.Context, input *ConfigInput) (ConfigVie
 	if err := ValidateConfigInput(input); err != nil {
 		return ConfigView{}, err
 	}
+	if input.Enabled && s.vectorStore == nil {
+		return ConfigView{}, ErrNoVectorStore
+	}
+	// Everything that can reject the save happens before anything is created in
+	// the vector store. Provisioning first left a namespace behind whenever the
+	// save was then rejected, and surfaced whatever the store said about a
+	// dimension mismatch in place of the ErrInvalidConfig the request earned.
 	retired := retiredNamespaces(previous)
 	if embeddingSpaceChanged(previous, input) && previous.LogVectorStoreNamespace == input.LogVectorStoreNamespace {
 		return ConfigView{}, fmt.Errorf("%w: log_vector_store_namespace must change when embedding provider, model, or dimension changes", ErrInvalidConfig)
 	}
 	if embeddingSpaceChanged(previous, input) && strings.TrimSpace(previous.LogVectorStoreNamespace) != "" {
 		retired = appendUnique(retired, previous.LogVectorStoreNamespace)
+	}
+	if input.Enabled {
+		// Still ahead of the write: a namespace that cannot be created is a save
+		// that cannot work, and the config must not claim otherwise. A namespace
+		// created here and then orphaned by a failing write is deliberately left
+		// in place - it is empty and idempotently reused on the retry, whereas
+		// deleting one risks destroying vectors a previous config still indexes.
+		if err := ensureWarpNamespace(ctx, s.vectorStore, input.LogVectorStoreNamespace, input.EmbeddingDimension); err != nil {
+			return ConfigView{}, fmt.Errorf("ensure warp vector namespace: %w", err)
+		}
 	}
 	retiredJSON, err := sonic.Marshal(retired)
 	if err != nil {
@@ -240,7 +259,7 @@ func (s *Service) SaveConfig(ctx context.Context, input *ConfigInput) (ConfigVie
 	if err := s.store.UpsertWarpConfig(ctx, row); err != nil {
 		return ConfigView{}, err
 	}
-	return configViewFromRow(row), nil
+	return s.configViewFromRow(row), nil
 }
 
 // mergeOmittedEmbeddingSettings fills embedding fields the write left empty
@@ -384,7 +403,7 @@ func (s *Service) Config(ctx context.Context) (*schemas.WarpConfig, error) {
 
 // configViewFromRow renders a stored row for display, resolving defaults so the
 // form never has to show a zero where a default applies.
-func configViewFromRow(row *tables.TableWarpConfig) ConfigView {
+func (s *Service) configViewFromRow(row *tables.TableWarpConfig) ConfigView {
 	config := configFromRow(row)
 	return ConfigView{
 		Configured:              config.IsConfigured(),
@@ -404,6 +423,7 @@ func configViewFromRow(row *tables.TableWarpConfig) ConfigView {
 		LogVectorStoreNamespace: config.EffectiveLogVectorStoreNamespace(),
 		SemanticSearchThreshold: config.EffectiveSemanticSearchThreshold(),
 		SemanticSearchLimit:     config.EffectiveSemanticSearchLimit(),
+		VectorStoreConnected:    s.vectorStore != nil,
 	}
 }
 
