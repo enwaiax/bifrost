@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"reflect"
 	"sync"
@@ -579,6 +580,10 @@ type fakeSidekiqStore struct {
 	jobs     map[string]*tables.TableSidekiqJob
 	created  int
 	inFlight *tables.TableSidekiqJob
+	// failGetAfterCancel makes the post-cancel re-read fail, which is the case
+	// where a handler could report the pre-cancel status back to the caller.
+	failGetAfterCancel bool
+	cancelled          bool
 }
 
 // newFakeSidekiqStore verifies new fake sidekiq store.
@@ -607,6 +612,9 @@ func (s *fakeSidekiqStore) CreateSidekiqJob(ctx context.Context, job *tables.Tab
 func (s *fakeSidekiqStore) GetSidekiqJob(ctx context.Context, id string) (*tables.TableSidekiqJob, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.failGetAfterCancel && s.cancelled {
+		return nil, fmt.Errorf("read failed after cancel")
+	}
 	if job, ok := s.jobs[id]; ok {
 		copy := *job
 		return &copy, nil
@@ -669,6 +677,7 @@ func (s *fakeSidekiqStore) CancelSidekiqJob(ctx context.Context, id string) (boo
 		return false, nil
 	}
 	job.Status = tables.SidekiqStatusCancelled
+	s.cancelled = true
 	if s.inFlight != nil && s.inFlight.ID == id {
 		s.inFlight = nil
 	}
