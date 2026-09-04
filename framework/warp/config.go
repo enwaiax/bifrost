@@ -212,8 +212,23 @@ func (s *Service) SaveConfig(ctx context.Context, input *ConfigInput) (ConfigVie
 	// save was then rejected, and surfaced whatever the store said about a
 	// dimension mismatch in place of the ErrInvalidConfig the request earned.
 	retired := retiredNamespaces(previous)
-	if embeddingSpaceChanged(previous, input) && previous.LogVectorStoreNamespace == input.LogVectorStoreNamespace {
-		return ConfigView{}, fmt.Errorf("%w: log_vector_store_namespace must change when embedding provider, model, or dimension changes", ErrInvalidConfig)
+	// Compared as effective namespaces, not raw strings. A legacy row storing ""
+	// or a padded value resolves to the same namespace the request does, so a
+	// raw comparison saw "different" and let an embedding-space change reuse the
+	// namespace it was already indexed under - mixing vectors from two
+	// configurations in one place, which is exactly what this rule prevents.
+	if embeddingSpaceChanged(previous, input) &&
+		normalizedNamespace(previous.LogVectorStoreNamespace) == normalizedNamespace(input.LogVectorStoreNamespace) {
+		return ConfigView{}, fmt.Errorf("%w: log_vector_store_namespace must change when the embedding provider, model or dimension changes", ErrInvalidConfig)
+	}
+	if embeddingSpaceChanged(previous, input) && s.backfillJobs != nil {
+		active, activeErr := s.backfillJobs.GetInFlightSidekiqJobByKind(ctx, BackfillJobKind)
+		if activeErr != nil {
+			return ConfigView{}, activeErr
+		}
+		if active != nil {
+			return ConfigView{}, ErrBackfillInProgress
+		}
 	}
 	if embeddingSpaceChanged(previous, input) && strings.TrimSpace(previous.LogVectorStoreNamespace) != "" {
 		retired = appendUnique(retired, previous.LogVectorStoreNamespace)
@@ -466,7 +481,25 @@ func embeddingSpaceChanged(row *tables.TableWarpConfig, input *ConfigInput) bool
 	if input == nil || input.EmbeddingProvider == "" || input.EmbeddingModel == "" || input.EmbeddingDimension <= 0 {
 		return false
 	}
+	// The namespace is part of the space, not a label on it. A running backfill
+	// freezes a signature that includes the effective namespace, so a
+	// namespace-only rename slipped past the active-job guard, was persisted,
+	// and then made the job abort on its next signature check - which is not the
+	// job continuing safely, it is the job failing.
+	if normalizedNamespace(row.LogVectorStoreNamespace) != normalizedNamespace(input.LogVectorStoreNamespace) {
+		return true
+	}
 	return row.EmbeddingProvider != string(input.EmbeddingProvider) || row.EmbeddingModel != input.EmbeddingModel || row.EmbeddingDimension != input.EmbeddingDimension
+}
+
+// normalizedNamespace matches what EffectiveLogVectorStoreNamespace resolves to,
+// so whitespace alone never reads as a different space.
+func normalizedNamespace(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return schemas.WarpDefaultLogVectorStoreNamespace
+	}
+	return trimmed
 }
 
 func retiredNamespaces(row *tables.TableWarpConfig) []string {
