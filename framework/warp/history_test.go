@@ -97,6 +97,23 @@ func (m *memoryConversations) DeleteWarpConversationsOlderThan(_ context.Context
 	return deleted, nil
 }
 
+func (m *memoryConversations) SumWarpMessageUsage(_ context.Context, ids []string) (map[string]logstore.WarpUsageTotals, error) {
+	totals := map[string]logstore.WarpUsageTotals{}
+	for _, id := range ids {
+		thread, ok := m.threads[id]
+		if !ok {
+			continue
+		}
+		var sum logstore.WarpUsageTotals
+		for _, message := range thread.Messages {
+			sum.TotalTokens += message.TotalTokens
+			sum.Cost += message.Cost
+		}
+		totals[id] = sum
+	}
+	return totals, nil
+}
+
 func (m *memoryConversations) CountWarpMessages(_ context.Context, ids []string) (map[string]int, error) {
 	counts := map[string]int{}
 	for _, id := range ids {
@@ -268,8 +285,12 @@ func TestWarpRecordTurnReturnsNoIDWhenPersistenceFails(t *testing.T) {
 	store := newMemoryConversations()
 	service := historyService(store)
 
-	// An id the caller made up: AppendWarpMessages rejects it as not theirs.
-	turn := &Turn{ConversationID: "someone-elses-thread", question: "how much did we spend?"}
+	// A store that refuses the append. An id the caller supplied but that never
+	// reached storage must not come back as though the turn were filed - the
+	// recovery path that re-creates a missing thread cannot help here, because
+	// the write itself is what failed.
+	store.failAppend = errors.New("append exploded")
+	turn := &Turn{ConversationID: "c-1", question: "how much did we spend?"}
 	saved := service.recordTurn(ownerCtx("u-1"), turn, ChatResponse{Answer: "$412."})
 
 	require.Empty(t, saved, "an id that was never persisted must not be reported back to the client")
@@ -423,4 +444,112 @@ func TestWarpRecordTurnStillSkipsTrulyEmptyTurns(t *testing.T) {
 	service := historyService(store)
 	require.Empty(t, service.recordTurn(ownerCtx("u1"), &Turn{question: "anything?"}, ChatResponse{}))
 	require.Empty(t, store.threads)
+}
+
+// A partial answer must stay marked as partial once filed. Reopening a thread
+// and seeing "$12" with no hint that Warp ran out of steps would present a
+// half-checked figure as a settled one.
+func TestWarpRecordTurnKeepsFinishReason(t *testing.T) {
+	store := newMemoryConversations()
+	service := historyService(store)
+	id := service.recordTurn(ownerCtx("u1"), &Turn{ConversationID: "t-partial", IsNew: true, question: "q"}, ChatResponse{
+		Answer: "About $12.", FinishReason: FinishReasonPartial,
+	})
+	thread := store.threads[id]
+	require.Len(t, thread.Messages, 2)
+	require.Equal(t, FinishReasonPartial, thread.Messages[1].FinishReason)
+	require.Empty(t, thread.Messages[0].FinishReason, "a user turn has no finish reason")
+
+	detail := conversationDetailFromRow(thread)
+	require.Equal(t, FinishReasonPartial, detail.Messages[1].FinishReason)
+}
+
+// What a thread cost is filed with each answer and summed for the list, so the
+// history can show spend per conversation without loading transcripts.
+func TestWarpRecordTurnFilesUsageAndListsTotals(t *testing.T) {
+	store := newMemoryConversations()
+	service := historyService(store)
+	usage := func(tokens int, cost float64) *schemas.BifrostLLMUsage {
+		return &schemas.BifrostLLMUsage{TotalTokens: tokens, Cost: &schemas.BifrostCost{TotalCost: cost}}
+	}
+	id := service.recordTurn(ownerCtx("u1"), &Turn{ConversationID: "t-cost", IsNew: true, question: "q1"}, ChatResponse{Answer: "a1", Usage: usage(120, 0.0123)})
+	service.recordTurn(ownerCtx("u1"), &Turn{ConversationID: id, question: "q2"}, ChatResponse{Answer: "a2", Usage: usage(80, 0.0077)})
+
+	thread := store.threads[id]
+	require.Len(t, thread.Messages, 4)
+	require.Equal(t, 120, thread.Messages[1].TotalTokens)
+	require.InDelta(t, 0.0123, thread.Messages[1].Cost, 1e-9)
+	require.Zero(t, thread.Messages[0].Cost, "user turns cost nothing")
+
+	// A resolved owner, the same value warpOwnerFor hands the handler.
+	list, err := service.ListConversations(ownerCtx("u1"), schemas.WarpOwnerID("u1"), 10)
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	require.InDelta(t, 0.02, list[0].TotalCost, 1e-9)
+	require.Equal(t, 200, list[0].TotalTokens)
+
+	detail := conversationDetailFromRow(thread)
+	require.InDelta(t, 0.0077, detail.Messages[3].Cost, 1e-9)
+	require.Equal(t, 80, detail.Messages[3].TotalTokens)
+}
+
+// A turn that ends by asking something is still the start of a thread. The id
+// has already gone to the client on the done frame, so if nothing is filed
+// here every later turn arrives for a thread that does not exist and is
+// dropped - which is how most chats went unrecorded, since Warp usually asks
+// about the window or the scope first.
+func TestWarpRecordTurnFilesQuestionTurns(t *testing.T) {
+	store := newMemoryConversations()
+	service := historyService(store)
+	id := service.recordTurn(ownerCtx("u1"), &Turn{ConversationID: "t-q", IsNew: true, question: "what did we spend?"}, ChatResponse{
+		FinishReason: "question",
+		Question:     &Question{Question: "Which time range?", Options: []QuestionOpt{{Label: "Last 7 days", Hint: "-7d"}}},
+	})
+	thread := store.threads[id]
+	require.NotNil(t, thread, "the thread must exist before the answer to the question arrives")
+	require.Len(t, thread.Messages, 2)
+	require.Equal(t, "Which time range?", thread.Messages[1].Content)
+	require.Equal(t, "question", thread.Messages[1].FinishReason)
+}
+
+// The fold has to carry the question for the above to work: it is the only
+// thing the JSON transport and the recorder see.
+func TestWarpFoldCarriesQuestion(t *testing.T) {
+	f := newFold()
+	f.apply(Event{Type: EventQuestion, Question: &Question{Question: "Whose traffic?"}})
+	f.apply(Event{Type: EventDone, FinishReason: "question"})
+	result := f.result()
+	require.NotNil(t, result.Question)
+	require.Equal(t, "Whose traffic?", result.Question.Question)
+	require.Equal(t, "question", result.FinishReason)
+}
+
+// A continuation for a thread the store has never seen is filed as a new
+// thread under that id rather than dropped. The client only ever holds ids the
+// server minted, and a dropped turn is a silently lost conversation.
+func TestWarpRecordTurnRecreatesMissingThread(t *testing.T) {
+	store := newMemoryConversations()
+	service := historyService(store)
+	id := service.recordTurn(ownerCtx("u1"), &Turn{ConversationID: "t-lost", IsNew: false, question: "-7d"}, ChatResponse{Answer: "$12."})
+	require.Equal(t, "t-lost", id)
+	thread := store.threads["t-lost"]
+	require.NotNil(t, thread)
+	require.Equal(t, schemas.WarpOwnerID("u1"), thread.OwnerID, "authenticated owners are namespaced")
+	require.Len(t, thread.Messages, 2)
+}
+
+// The sidebar and the opened thread must agree about what a conversation cost.
+func TestConversationDetailReportsAggregateUsage(t *testing.T) {
+	now := time.Date(2026, 9, 16, 9, 0, 0, 0, time.UTC)
+	detail := conversationDetailFromRow(&logstore.WarpConversation{
+		ID: "conv-1", Title: "spend", CreatedAt: now, UpdatedAt: now,
+		Messages: []logstore.WarpMessage{
+			{ID: "m1", Role: "user", Content: "how much?", CreatedAt: now},
+			{ID: "m2", Role: "assistant", Content: "a lot", TotalTokens: 120, Cost: 0.0021, CreatedAt: now},
+			{ID: "m3", Role: "assistant", Content: "more", TotalTokens: 80, Cost: 0.0014, CreatedAt: now},
+		},
+	})
+	require.Equal(t, 200, detail.TotalTokens)
+	require.InDelta(t, 0.0035, detail.TotalCost, 1e-9)
+	require.Equal(t, 3, detail.MessageCount)
 }

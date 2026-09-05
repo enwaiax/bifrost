@@ -2,6 +2,7 @@ package warp
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/bytedance/sonic"
@@ -60,6 +61,11 @@ func (s *Service) ListConversations(ctx context.Context, ownerID string, limit i
 		s.warnf("failed to count warp messages: %v", err)
 		counts = map[string]int{}
 	}
+	totals, err := s.conversations.SumWarpMessageUsage(ctx, ids)
+	if err != nil {
+		s.warnf("failed to sum warp message usage: %v", err)
+		totals = map[string]logstore.WarpUsageTotals{}
+	}
 
 	conversations := make([]schemas.WarpConversation, 0, len(rows))
 	for _, row := range rows {
@@ -67,6 +73,8 @@ func (s *Service) ListConversations(ctx context.Context, ownerID string, limit i
 			ID:           row.ID,
 			Title:        row.Title,
 			MessageCount: counts[row.ID],
+			TotalTokens:  totals[row.ID].TotalTokens,
+			TotalCost:    totals[row.ID].Cost,
 			CreatedAt:    row.CreatedAt,
 			UpdatedAt:    row.UpdatedAt,
 		})
@@ -202,18 +210,28 @@ func (s *Service) stopHistoryCleanup() {
 // conversationDetailFromRow renders a stored thread for the API.
 func conversationDetailFromRow(row *logstore.WarpConversation) schemas.WarpConversationDetail {
 	messages := make([]schemas.WarpStoredMessage, 0, len(row.Messages))
+	// Summed here rather than left at zero: the list endpoint reports these from
+	// SumWarpMessageUsage, so the same thread showed spend in the sidebar and
+	// nothing at all once it was opened.
+	totalTokens := 0
+	totalCost := 0.0
 	for _, message := range row.Messages {
 		stored := schemas.WarpStoredMessage{
-			Role:      message.Role,
-			Content:   message.Content,
-			Error:     message.Error,
-			CreatedAt: message.CreatedAt,
+			Role:         message.Role,
+			Content:      message.Content,
+			Error:        message.Error,
+			FinishReason: message.FinishReason,
+			TotalTokens:  message.TotalTokens,
+			Cost:         message.Cost,
+			CreatedAt:    message.CreatedAt,
 		}
 		if message.ToolCallsJSON != "" {
 			// A transcript is still worth showing without its tool trace, so a
 			// decode failure drops the trace rather than the message.
 			_ = sonic.UnmarshalString(message.ToolCallsJSON, &stored.ToolCalls)
 		}
+		totalTokens += message.TotalTokens
+		totalCost += message.Cost
 		messages = append(messages, stored)
 	}
 	return schemas.WarpConversationDetail{
@@ -221,6 +239,8 @@ func conversationDetailFromRow(row *logstore.WarpConversation) schemas.WarpConve
 			ID:           row.ID,
 			Title:        row.Title,
 			MessageCount: len(row.Messages),
+			TotalTokens:  totalTokens,
+			TotalCost:    totalCost,
 			CreatedAt:    row.CreatedAt,
 			UpdatedAt:    row.UpdatedAt,
 		},
@@ -252,6 +272,31 @@ func (s *Service) recordTurn(ctx context.Context, turn *Turn, response ChatRespo
 	}
 	if response.Error != nil {
 		stored.Error = response.Error.Message
+	}
+	// A turn that ended by asking is filed with the question as its content.
+	// The thread id has already gone to the client on the done frame, so the
+	// thread must exist now or every later turn will arrive for a thread that
+	// was never created. Warp usually asks about the window or the scope
+	// first, which made this the common case rather than the edge.
+	// Whenever a question was posed, not only when it arrived alone. The model
+	// often narrates before asking ("let me check the window first..."), and
+	// fold.result() then sets both Answer and Question - so keying on an empty
+	// answer filed the narration and dropped the pending question, and reopening
+	// the thread showed prose with nothing to reply to.
+	if response.Question != nil {
+		stored.Content = response.Question.Question
+		stored.FinishReason = response.FinishReason
+	}
+	// Only the partial marker is filed. A normal stop is the default reading of
+	// any stored answer, and writing it on every row would say nothing.
+	if response.FinishReason == FinishReasonPartial {
+		stored.FinishReason = FinishReasonPartial
+	}
+	if response.Usage != nil {
+		stored.TotalTokens = response.Usage.TotalTokens
+		if response.Usage.Cost != nil {
+			stored.Cost = response.Usage.Cost.TotalCost
+		}
 	}
 	for _, call := range response.ToolCalls {
 		stored.ToolCalls = append(stored.ToolCalls, schemas.WarpStoredToolCall{
@@ -319,7 +364,7 @@ func (s *Service) persistTurn(ctx context.Context, conversationID string, isNew 
 		conversationID = uuid.NewString()
 		isNew = true
 	}
-	if isNew {
+	create := func() bool {
 		if err := s.conversations.CreateWarpConversation(ctx, &logstore.WarpConversation{
 			ID:        conversationID,
 			OwnerID:   owner,
@@ -328,7 +373,7 @@ func (s *Service) persistTurn(ctx context.Context, conversationID string, isNew 
 			UpdatedAt: now,
 		}); err != nil {
 			s.warnf("failed to start warp conversation: %v", err)
-			return ""
+			return false
 		}
 		createdHere = true
 		// Prune on creation rather than on a timer: it is the only moment the
@@ -336,6 +381,10 @@ func (s *Service) persistTurn(ctx context.Context, conversationID string, isNew 
 		if _, err := s.conversations.PruneWarpConversations(ctx, owner, schemas.WarpMaxConversationsPerOwner); err != nil {
 			s.warnf("failed to prune warp conversations: %v", err)
 		}
+		return true
+	}
+	if isNew && !create() {
+		return ""
 	}
 
 	toolCallsJSON := ""
@@ -345,13 +394,30 @@ func (s *Service) persistTurn(ctx context.Context, conversationID string, isNew 
 		}
 	}
 
-	if err := s.conversations.AppendWarpMessages(ctx, owner, conversationID, []logstore.WarpMessage{
+	messages := []logstore.WarpMessage{
 		{ID: uuid.NewString(), Role: questionRole, Content: question, CreatedAt: now},
 		{
 			ID: uuid.NewString(), Role: "assistant", Content: answer.Content,
-			ToolCallsJSON: toolCallsJSON, Error: answer.Error, CreatedAt: now,
+			ToolCallsJSON: toolCallsJSON, Error: answer.Error, FinishReason: answer.FinishReason,
+			TotalTokens: answer.TotalTokens, Cost: answer.Cost, CreatedAt: now,
 		},
-	}); err != nil {
+	}
+	err := s.conversations.AppendWarpMessages(ctx, owner, conversationID, messages)
+	if errors.Is(err, logstore.ErrWarpConversationNotFound) && !isNew {
+		// The client holds an id the server minted but never filed a thread
+		// for - a first turn that was lost, or a thread pruned since. Starting
+		// the thread now under that id keeps the conversation rather than
+		// dropping every turn from here on.
+		// The append is retried whether or not create() succeeded. Two
+		// continuations for the same missing id both get ErrWarpConversationNotFound;
+		// the loser's create() fails on the duplicate key, and returning here
+		// dropped its turn. Retrying is safe because the append is ownership
+		// scoped: it lands if the winner filed the thread under this owner, and
+		// stays not-found if the id belongs to someone else.
+		create()
+		err = s.conversations.AppendWarpMessages(ctx, owner, conversationID, messages)
+	}
+	if err != nil {
 		s.warnf("failed to append warp messages: %v", err)
 		if createdHere {
 			if cleanupErr := s.conversations.DeleteWarpConversation(ctx, owner, conversationID); cleanupErr != nil {
