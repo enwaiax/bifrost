@@ -273,14 +273,33 @@ func (mc *ModelCatalog) computeProvidersForModel(model string) []schemas.ModelPr
 			continue
 		}
 		allowed := mc.keyconf.AllowedFor(p)
+		// a vLLM key with no cached list-models result routes by its configured
+		// ModelName, which stands in for that key's list-models output.
+		matchesModelName, hasModelName := false, false
+		for _, e := range mc.keyconf.EntriesFor(p) {
+			if !e.Enabled || e.ModelName == "" || mc.live.Has(p, e.KeyID, false) {
+				continue
+			}
+			if !e.Allowed.IsAllowed(e.ModelName) || e.Blacklisted.IsBlocked(e.ModelName) {
+				continue
+			}
+			hasModelName = true
+			if strings.EqualFold(e.ModelName, model) {
+				matchesModelName = true
+				break
+			}
+		}
 		matched := false
 		if _, hit := mc.keyconf.ResolveAlias(p, model); hit && allowed.IsAllowed(model) {
 			matched = true
 		} else if allowed.Contains(model) {
 			matched = true
+		} else if matchesModelName {
+			matched = true
 		} else if allowed.IsUnrestricted() &&
 			len(mc.datasheet.DatasheetModelsForProvider(p)) == 0 &&
-			len(mc.live.UnfilteredModelsForProvider(p)) == 0 {
+			len(mc.live.UnfilteredModelsForProvider(p)) == 0 &&
+			!hasModelName {
 			matched = true
 		}
 		if matched {
